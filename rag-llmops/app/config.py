@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -7,8 +7,17 @@ class Settings(BaseSettings):
     embedding_model: str
     embedding_dimensions: int
 
-    class Config:
-        env_file = ".env"
+    # Langfuse configuration (Optional, defaults to None if not in .env)
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str | None = "https://cloud.langfuse.com"
+
+    # This ensures Pydantic reads the .env file and ignores extra fields safely
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
 
 settings = Settings()
