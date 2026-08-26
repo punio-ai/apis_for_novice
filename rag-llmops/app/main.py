@@ -1,13 +1,15 @@
-from app.processing import extract_text_from_pdf, chunk_text
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
-from fastapi import HTTPException
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func
+from pydantic import BaseModel
+
+from app.processing import extract_text_from_pdf, chunk_text
 from app.database import init_db, get_db
 from app.models import DocumentChunk
 from app.config import settings
-from pydantic import BaseModel
+from app.retrieval import hybrid_search
+from app.ollama_client import get_embeddings_batch  # <-- NEW IMPORT
 
 app = FastAPI(title="Production RAG LLMOps API (Ollama)")
 
@@ -16,52 +18,7 @@ app = FastAPI(title="Production RAG LLMOps API (Ollama)")
 async def startup():
     await init_db()
 
-# --- OLLAMA HELPER ---
-
-
-async def get_embedding(text: str) -> list[float]:
-    """Fetches embedding from local Ollama instance asynchronously."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(
-                f"{settings.ollama_base_url}/api/embeddings",
-                json={"model": settings.embedding_model, "prompt": text}
-            )
-            response.raise_for_status()
-            return response.json()["embedding"]
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=500, detail=f"Ollama API error: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to generate embedding: {str(e)}")
-
 # --- ENDPOINTS ---
-
-
-async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
-    """Fetches embeddings for a batch of texts from local Ollama asynchronously."""
-    if not texts:
-        return []
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            # Using the newer /api/embed endpoint which supports batch inputs
-            response = await client.post(
-                f"{settings.ollama_base_url}/api/embed",
-                json={
-                    "model": settings.embedding_model,
-                    "input": texts
-                }
-            )
-            response.raise_for_status()
-            return response.json()["embeddings"]
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=500, detail=f"Ollama API error: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to generate embeddings: {str(e)}")
 
 
 class IngestRequest(BaseModel):
@@ -71,10 +28,10 @@ class IngestRequest(BaseModel):
 
 @app.post("/ingest")
 async def ingest_document(payload: IngestRequest, db: AsyncSession = Depends(get_db)):
-    # 1. Generate real embedding via Ollama
+    # Import get_embedding locally or from ollama_client if still needed
+    from app.ollama_client import get_embedding
     embedding_vector = await get_embedding(payload.text)
 
-    # 2. Store in pgvector
     new_chunk = DocumentChunk(
         document_name=payload.document_name,
         chunk_text=payload.text,
@@ -92,7 +49,6 @@ async def ingest_document(payload: IngestRequest, db: AsyncSession = Depends(get
     }
 
 
-# --- NEW PRODUCTION ENDPOINT ---
 @app.post("/ingest-file")
 async def ingest_file(
     file: UploadFile = File(...),
@@ -102,23 +58,17 @@ async def ingest_file(
         raise HTTPException(
             status_code=400, detail="Only PDF files are currently supported.")
 
-    # 1. Read file asynchronously
     file_bytes = await file.read()
-
-    # 2. Extract text
     raw_text = extract_text_from_pdf(file_bytes)
     if not raw_text.strip():
         raise HTTPException(
             status_code=400, detail="Could not extract text from PDF. Is it scanned/image-based?")
 
-    # 3. Chunk the text
     chunks = chunk_text(raw_text)
     if not chunks:
         raise HTTPException(
             status_code=400, detail="No chunks generated from text.")
 
-    # 4. Batch generate embeddings (The LLMOps Performance Trick)
-    # We process in batches of 20 to avoid overwhelming Ollama's memory
     all_embeddings = []
     batch_size = 20
     for i in range(0, len(chunks), batch_size):
@@ -126,12 +76,12 @@ async def ingest_file(
         batch_embeddings = await get_embeddings_batch(batch_chunks)
         all_embeddings.extend(batch_embeddings)
 
-    # 5. Bulk insert into PostgreSQL
     db_objects = [
         DocumentChunk(
             document_name=file.filename,
             chunk_text=chunk_text_item,
-            embedding=embedding_vector
+            embedding=embedding_vector,
+            text_search=func.to_tsvector('english', chunk_text_item)
         )
         for chunk_text_item, embedding_vector in zip(chunks, all_embeddings)
     ]
@@ -144,6 +94,57 @@ async def ingest_file(
         "filename": file.filename,
         "total_chunks": len(chunks),
         "dimensions": len(all_embeddings[0]) if all_embeddings else 0
+    }
+
+
+class QueryRequest(BaseModel):
+    query: str
+
+
+async def generate_answer(query: str, context_chunks: list[str]) -> str:
+    context = "\n\n---\n\n".join(context_chunks)
+    prompt = f"""You are a precise AI assistant. Answer the user's question using ONLY the provided context. 
+If the answer is not explicitly stated in the context, reply with: "I do not have enough information in the provided context to answer that."
+
+Context:
+{context}
+
+Question: {query}
+"""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            response = await client.post(
+                f"{settings.ollama_base_url}/api/chat",
+                json={
+                    "model": "llama3.1:8b",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False
+                }
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"LLM Generation failed: {str(e)}")
+
+
+@app.post("/query")
+async def query_system(payload: QueryRequest, db: AsyncSession = Depends(get_db)):
+    relevant_chunks = await hybrid_search(db, payload.query, top_k=4)
+
+    if not relevant_chunks:
+        return {"answer": "I could not find any relevant information in the documents.", "sources": []}
+
+    context_texts = [c.chunk_text for c in relevant_chunks]
+    answer = await generate_answer(payload.query, context_texts)
+
+    sources = [{"document": c.document_name,
+                "text_preview": c.chunk_text[:100] + "..."} for c in relevant_chunks]
+
+    return {
+        "query": payload.query,
+        "answer": answer,
+        "sources": sources
     }
 
 
