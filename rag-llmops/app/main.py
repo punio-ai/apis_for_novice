@@ -1,3 +1,4 @@
+
 import uuid  # Add this to your imports at the top of main.py
 from fastapi import HTTPException
 import uuid
@@ -222,7 +223,7 @@ Question: {query}
 
             # 3. Log the successful generation to Langfuse
             trace.generation(
-                name="llama3-generation",
+                name="ll",
                 model="llama3.1:8b",
                 input=prompt,
                 output=answer_text
