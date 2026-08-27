@@ -1,9 +1,18 @@
+# Python
 __pycache__/
-*.pyc
-.env
-*.db
-.venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
-pytest
-pytest-asyncio
-httpx
+env/
+.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
