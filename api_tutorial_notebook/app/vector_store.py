@@ -1,6 +1,6 @@
 import os
 from langchain_ollama import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 # 1. Define where to save the vector database locally
 CHROMA_PERSIST_DIR = "./chroma_db"

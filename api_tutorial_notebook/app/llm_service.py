@@ -3,31 +3,39 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Point to your local Ollama instance
-OLLAMA_API_URL = "http://localhost:11434/api/generate"
+# UPGRADE: Use the /api/chat endpoint for instruct/chat models
+OLLAMA_API_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "llama3.2:latest"
 
 
 async def generate_summary(text: str) -> str:
     """
-    Calls the local Ollama API to generate a 3-bullet-point summary.
+    Calls the local Ollama API using the modern /api/chat format 
+    to generate a 3-bullet-point summary.
     """
-    prompt = f"Summarize the following text in exactly 3 concise bullet points:\n\n{text}"
-
     payload = {
         "model": MODEL_NAME,
-        "prompt": prompt,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a precise technical assistant. Summarize the provided text into exactly 3 concise bullet points. Do not add conversational filler or introductory text."
+            },
+            {
+                "role": "user",
+                "content": f"Summarize the following text:\n\n{text}"
+            }
+        ],
         "stream": False  # We want the full response at once for a background task
     }
 
     try:
-        # Use a timeout because local LLMs can sometimes hang or take time to load into memory
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(OLLAMA_API_URL, json=payload)
-            response.raise_for_status()  # Raises an error for 4xx/5xx status codes
+            response.raise_for_status()
 
             result = response.json()
-            return result.get("response", "No summary generated.")
+            # The /api/chat endpoint returns the text inside message.content
+            return result.get("message", {}).get("content", "No summary generated.")
 
     except httpx.ConnectError:
         logger.error("Failed to connect to Ollama. Is 'ollama serve' running?")
